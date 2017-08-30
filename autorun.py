@@ -1,29 +1,67 @@
 #!/usr/bin/env python 3
-from accessoryFunctions.accessoryFunctions import *
-from glob import glob
+import errno
+import os
 import shutil
+from glob import glob
+
 __author__ = 'adamkoziol'
+
+
+def printtime(string, start):
+    """
+    Prints a string in bold with the elapsed time
+    :param string: a string to be printed in bold
+    :param start: integer of the starting time
+    """
+    import time
+    print('\n\033[1m' + "[Elapsed Time: {:.2f} seconds] {}".format(time.time() - start, string) + '\033[0m')
+
+
+def make_path(inpath):
+    """
+    from: http://stackoverflow.com/questions/273192/check-if-a-directory-exists-and-create-it-if-necessary \
+    does what is indicated by the URL
+    :param inpath: string of the supplied path
+    """
+    try:
+        # os.makedirs makes parental folders as required
+        os.makedirs(inpath)
+    # Except os errors
+    except OSError as exception:
+        # If the os error is anything but directory exists, then raise
+        if exception.errno != errno.EEXIST:
+            raise
 
 
 class Autorun(object):
 
     def main(self):
+        """
+        Run the required methods
+        :return:
+        """
         import time
         printtime('Starting autorun pipeline', self.start)
         while True:
             # try:
             #     self.miseqrun()
             # except ValueError:
-            self.nasrun()
+            self.nascheck()
+            #
+            for run in self.verifiedrunlist:
+                self.nasmove(run)
+                self.startspades(run)
+                self.collectnasresults(run)
             printtime('Restarting loop in {}'.format(time.strftime("%M:%S", time.gmtime(self.sleeptime))), self.start)
-            time.sleep(self.sleeptime)
+            # time.sleep(self.sleeptime)
+            self.sleep()
 
     def miseqrun(self):
         pass
 
-    def nasrun(self):
+    def nascheck(self):
         """
-        Checks the NAS To_Assemble folder for runs to assemble. If runs are not being copied to, it will queue them to be
+        Checks the NAS To_Assemble folder for runs to assemble. If runs are not being copied, it will queue them to be
         moved to the NODE and assembled. Returns a list of runs to assemble, otherwise returns False
         """
         printtime('Checking NAS For unassembled runs', self.start)
@@ -36,8 +74,6 @@ class Autorun(object):
         if len(runlist) == 0:
             printtime('No Runs To Process', self.start)
         else:
-            # Initialise a list to store runs to be assembled
-            verifiedrunlist = list()
             # Iterate through the runs
             for run in runlist:
                 # Extract the name of the run from the path
@@ -49,25 +85,173 @@ class Autorun(object):
                 if "_Ready" in runname:
                     fastq_files = glob(os.path.join(run, '*fastq*'))
                     if len(fastq_files) > 0:
+                        # Create variables for the names of the metadata files
                         runinfostart = os.path.join(run, "RunInfo.xml")
                         samplesheetstart = os.path.join(run, "SampleSheet.csv")
                         generatefastqstart = os.path.join(run, "GenerateFASTQRunStatistics.xml")
-                        if os.path.isfile(generatefastqstart) and os.path.isfile(samplesheetstart) \
+                        # If one or more of the metadata files are absent, write a warning
+                        if not os.path.isfile(generatefastqstart) and os.path.isfile(samplesheetstart) \
                                 and os.path.isfile(runinfostart):
-                            pass
-                        else:
-                            printtime('Some metadata files are missing from {}'.format(runname), self.start)
+                            printtime('WARNING: Some metadata files are missing from {}'.format(runname), self.start)
                         newrunname = run + "_Queued"
-                        if len(verifiedrunlist) < 10:
+                        if len(self.verifiedrunlist) < 10:
                             shutil.move(run, newrunname)
-                            verifiedrunlist.append(newrunname)
+                            self.verifiedrunlist.append(newrunname)
                     else:
-                        printtime('{} contains no .fastq(.gz) files to assemble!'.format(runname), self.start)
+                        printtime('WARNING: {} contains no .fastq(.gz) files to assemble!'.format(runname), self.start)
                         continue
                 else:
-                    printtime('{} is present but not flagged as _Ready'.format(runname), self.start)
+                    printtime('WARNING: {} is present but not flagged as _Ready'.format(runname), self.start)
+        # If there are folder process, print the list of the queue
+        if len(self.verifiedrunlist) > 0:
+            printtime('SUCCESS: The Following Folders are Queued for Assembly: {}'
+                      .format(','.join(self.verifiedrunlist)), self.start)
+        # Otherwise indicate that the runs are processed
+        else:
+            printtime('All folders processed', self.start)
+
+    def nasmove(self, run):
+        """
+        Moves a given directory on the nas to the SSD on the node
+        :run: directory to be moved to the node
+        """
+        nodedir = os.path.join(self.destination, os.path.split(run)[1])
+        printtime('Copying {} to {} on node'.format(run, nodedir), self.start)
+        # If, for whatever reason, a folder with the same name exists in the destination folder, add a number to the
+        # name of the folder
+        if os.path.exists(nodedir):
+            # Allow up to 100 iterations
+            for x in range(1, 100):
+                # Add _X to the folder name
+                newdirname = nodedir + '_{}'.format(x)
+                # If the new directory exists as well, skip to the next iteration
+                if os.path.isdir(newdirname):
+                    continue
+                # Otherwise, replace the node directory variable
+                else:
+                    nodedir = newdirname
+                    printtime('WARNING: {} already exists on node! Appending _{} to directory'
+                              .format(nodedir, x), self.start)
+                    break
+        # Copy over the files from the NAS
+        try:
+            shutil.copytree(run, nodedir)
+            printtime('SUCCESS: Copy Complete', self.start)
+            return nodedir
+
+        except Exception as e:
+            printtime('ERROR: {} {}'.format(e.__doc__, e.message), self.start)
+            return False
+
+    def collectnasresults(self, run):
+        """
+        Varies from collect_miseq_results by sending results to originating folder with the "_Assembled" tag
+        :param run: Directory on the SSD containing results
+        :return: False if a failure to copy, Directory to Delete
+        """
+        runname = os.path.split(run)[1]
+        newrunname = runname.replace("_Ready_Queued", "_Assembled")
+        combined_metadata_path = os.path.join(run, "reports/combinedMetadata.csv")
+        nasrun = os.path.join(self.assemblyfolder, newrunname)
+        # Check to see if the combinedMetadata file has been created - its presence is an excellent indicator of
+        # whether the run assembled successfully
+        if os.path.isfile(combined_metadata_path):
+            printtime('SUCCESS: {} assembled'.format(runname), self.start)
+        else:
+            printtime('ERROR: {} did not assemble'.format(runname), self.start)
+
+        # Check that the folder doesn't exist in To_Assemble already
+        if os.path.isdir(nasrun):
+            # Allow up to 100 tries to rename
+            for x in range(1, 100):
+                newdirname = nasrun + '_{}'.format(x)
+                # If the new directory name exists as well, continue to the next iteration
+                if os.path.isdir(newdirname):
+                    continue
+                else:
+                    nasrun = newdirname
+                    printtime('WARNING: {} already exists in To_Assemble! Appending _{} to directory'
+                              .format(runname, x), self.start)
+                    break
+        # Copy the assembled run back to the NAS
+        printtime('Copying {} to {}'.format(run, nasrun), self.start)
+        # Attempt to copy the files to the NAS
+        try:
+            # Remove the .fastq.gz files in the runname directory, so they won't be copied back
+            for fastq in glob(os.path.join(run, '*.fastq.gz')):
+                os.remove(fastq)
+            # Copy the remaining files and folders
+            shutil.copytree(run, nasrun)
+            printtime('SUCCESS: Copying Results', self.start)
+            printtime('Cleaning up files on node', self.start)
+            # Remove the directory on the node
+            self.remove_directory(run)
+            # Remove the _Ready_Queued folder from the NAS
+            readyqueued = os.path.join(self.assemblyfolder, runname)
+            self.remove_directory(readyqueued)
+        except Exception as e:
+            printtime('ERROR: {} {}'.format(e.__doc__, e.message), self.start)
+            printtime('SKIPPING cleaning up Files on node due to error', self.start)
+
+    def startspades(self, nodedir):
+        """
+
+        :param nodedir:
+        """
+        import subprocess
+        printtime('Running Pipeline on {}'.format(nodedir), self.start)
+        try:
+            subprocess.call(['OLCspades.py', '-r', "/spadesfiles/", nodedir])
+            printtime('SUCCESS: Pipeline Finished', self.start)
+        except Exception as e:
+            printtime('ERROR: {} {}'.format(e.__doc__, e.message), self.start)
+
+    def remove_directory(self, directory):
+        """
+        Author: kkubasik
+        Link https://stackoverflow.com/questions/303200/how-do-i-remove-delete-a-folder-that-is-not-empty-with-python
+        Delete everything reachable from the directory named in 'top', assuming there are no symbolic links.
+        CAUTION:  This is dangerous!  For example, if top == '/', it could delete all your disk files.
+        """
+        # Set variables for directories that cannot be deleted
+        root_dir = '/'
+        backup_dir = os.path.join(self.nasmount, "MiSeq_Backup")
+        to_assemble_dir = os.path.join(self.nasmount, "To_Assemble")
+        # If the directory to be deleted is not one of the prohibited ones, proceed
+        if directory != root_dir and directory != backup_dir and directory != to_assemble_dir:
+            try:
+                # os.walk through all the files and folders in the directory
+                for root, dirs, files in os.walk(directory, topdown=False):
+                    # Remove the files
+                    for name in files:
+                        os.remove(os.path.join(root, name))
+                    # Remove the folders
+                    for name in dirs:
+                        os.rmdir(os.path.join(root, name))
+                # Remove the now empty directory
+                shutil.rmtree(directory)
+                printtime('SUCCESS {} Deleted'.format(directory), self.start)
+            except Exception as e:
+                printtime('ERROR {} {}'.format(e.__doc__, e.message), self.start)
+        else:
+            printtime('ERROR! Will not delete root of {}'.format(self.nasmount), self.start)
+
+    def sleep(self):
+        """
+
+        """
+        import sys
+        for i in range(self.sleeptime, 0, -10):
+            if i % 100 == 0:
+                printtime('Seconds remaining until loop restart: {}'.format(str(i)), self.start)
+                time.sleep(10)
+            else:
+                sys.stdout.write(str(i) + ' ')
+                sys.stdout.flush()
+                time.sleep(10)
 
     def __init__(self, args):
+        # Initialise variables from arguments
         self.miseqmount = os.path.join(args.miseqmountpoint, '')
         self.nasmount = os.path.join(args.nasmountpoint, '')
         self.destination = os.path.join(args.destinationmountpoint, '')
@@ -75,6 +259,8 @@ class Autorun(object):
         self.sleeptime = int(args.sleeptime)
         self.start = args.start
         self.logpath = os.path.join(self.nasmount, 'AssemblyLogs')
+        # Initialise a list to store runs to be assembled
+        self.verifiedrunlist = list()
         make_path(self.logpath)
         self.main()
 
@@ -108,5 +294,3 @@ if __name__ == '__main__':
     arguments.start = time.time()
     # Run it
     Autorun(arguments)
-    # Print a bold, green exit statement
-    print('\033[92m' + '\033[1m' + "\nElapsed Time: %0.2f seconds" % (time.time() - arguments.start) + '\033[0m')
